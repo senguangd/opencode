@@ -1,6 +1,7 @@
 import { expect } from "bun:test"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { LocationServiceMap } from "@opencode-ai/core/location-layer"
+import { Substitution } from "@opencode-ai/core/substitution"
 import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import path from "path"
@@ -27,6 +28,7 @@ const pluginUrl = pathToFileURL(path.join(import.meta.dir, "..", "fixture", "age
 const provider = ProviderTest.fake()
 const configLayer = Config.layer.pipe(
   Layer.provide(FSUtil.defaultLayer),
+  Layer.provide(Substitution.defaultLayer),
   Layer.provide(Env.defaultLayer),
   Layer.provide(AuthTest.empty),
   Layer.provide(AccountTest.empty),

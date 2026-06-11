@@ -9,6 +9,7 @@ import { Global } from "@opencode-ai/core/global"
 import fsNode from "fs/promises"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
+import { Substitution } from "@opencode-ai/core/substitution"
 import { Env } from "../env"
 import { applyEdits, modify } from "jsonc-parser"
 import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
@@ -32,7 +33,6 @@ import { ConfigManaged } from "./managed"
 import { ConfigParse } from "./parse"
 import { ConfigPaths } from "./paths"
 import { ConfigPlugin } from "./plugin"
-import { ConfigVariable } from "./variable"
 import { Npm } from "@opencode-ai/core/npm"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 
@@ -59,43 +59,6 @@ function normalizeLoadedConfig(data: unknown) {
   delete copy.keybinds
   delete copy.tui
   return copy
-}
-
-async function substituteWellKnownRemoteConfig(input: {
-  value: unknown
-  dir: string
-  source: string
-  env: Record<string, string>
-}) {
-  if (!isRecord(input.value) || typeof input.value.url !== "string") return undefined
-
-  const url = await ConfigVariable.substitute({
-    text: input.value.url,
-    type: "virtual",
-    dir: input.dir,
-    source: input.source,
-    env: input.env,
-  })
-  const headers = isRecord(input.value.headers)
-    ? Object.fromEntries(
-        await Promise.all(
-          Object.entries(input.value.headers)
-            .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-            .map(async ([key, value]) => [
-              key,
-              await ConfigVariable.substitute({
-                text: value,
-                type: "virtual",
-                dir: input.dir,
-                source: input.source,
-                env: input.env,
-              }),
-            ]),
-        ),
-      )
-    : undefined
-
-  return { url, headers }
 }
 
 async function resolveLoadedPlugins<T extends { plugin?: ConfigPluginV1.Spec[] }>(config: T, filepath: string) {
@@ -181,6 +144,7 @@ export const layer = Layer.effect(
     const env = yield* Env.Service
     const npmSvc = yield* Npm.Service
     const http = yield* HttpClient.HttpClient
+    const substitution = yield* Substitution.Service
 
     const readConfigFile = (filepath: string) => fs.readFileStringSafe(filepath).pipe(Effect.orDie)
 
@@ -210,19 +174,57 @@ export const layer = Layer.effect(
       )
     })
 
+    const substituteWellKnownRemoteConfig = Effect.fnUntraced(function* (input: {
+      value: unknown
+      dir: string
+      source: string
+      env: Record<string, string>
+    }) {
+      if (!isRecord(input.value) || typeof input.value.url !== "string") return undefined
+      const url = yield* substitution
+        .substitute({
+          text: input.value.url,
+          type: "virtual",
+          dir: input.dir,
+          source: input.source,
+          env: input.env,
+        })
+        .pipe(Effect.orDie)
+      const headers = isRecord(input.value.headers)
+        ? Object.fromEntries(
+            yield* Effect.forEach(
+              Object.entries(input.value.headers).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+              ([key, value]) =>
+                substitution
+                  .substitute({
+                    text: value,
+                    type: "virtual",
+                    dir: input.dir,
+                    source: input.source,
+                    env: input.env,
+                  })
+                  .pipe(Effect.orDie, Effect.map((result) => [key, result] as const)),
+              { concurrency: "unbounded" },
+            ),
+          )
+        : undefined
+
+      return { url, headers }
+    })
+
     const loadConfig = Effect.fnUntraced(function* (
       text: string,
       options: { path: string } | { dir: string; source: string },
       env?: Record<string, string>,
     ) {
       const source = "path" in options ? options.path : options.source
-      const expanded = yield* Effect.promise(() =>
-        ConfigVariable.substitute(
+      const expanded = yield* substitution
+        .substitute(
           "path" in options
             ? { text, type: "path", path: options.path, env }
             : { text, type: "virtual", ...options, env },
-        ),
-      )
+        )
+        .pipe(Effect.orDie)
       const parsed = ConfigParse.jsonc(expanded, source)
       const data = ConfigParse.schema(ConfigV1.Info, normalizeLoadedConfig(parsed), source)
       if (!("path" in options)) return data
@@ -359,14 +361,12 @@ export const layer = Layer.effect(
             const wellknownURL = `${url}/.well-known/opencode`
             yield* Effect.logDebug("fetching remote config", { url: wellknownURL })
             const wellknown = yield* fetchRemoteJson(wellknownURL, undefined, ConfigV1.WellKnown, url)
-            const remote = yield* Effect.promise(() =>
-              substituteWellKnownRemoteConfig({
-                value: wellknown.remote_config,
-                dir: url,
-                source: wellknownURL,
-                env: authEnv,
-              }),
-            )
+            const remote = yield* substituteWellKnownRemoteConfig({
+              value: wellknown.remote_config,
+              dir: url,
+              source: wellknownURL,
+              env: authEnv,
+            })
             const fetchedConfig = remote
               ? yield* Effect.gen(function* () {
                   yield* Effect.logDebug("fetching remote config", { url: remote.url })
@@ -674,6 +674,7 @@ export const layer = Layer.effect(
 export const defaultLayer = layer.pipe(
   Layer.provide(EffectFlock.defaultLayer),
   Layer.provide(FSUtil.defaultLayer),
+  Layer.provide(Substitution.defaultLayer),
   Layer.provide(Env.defaultLayer),
   Layer.provide(Auth.defaultLayer),
   Layer.provide(Account.defaultLayer),
@@ -681,6 +682,14 @@ export const defaultLayer = layer.pipe(
   Layer.provide(FetchHttpClient.layer),
 )
 
-export const node = LayerNode.make(layer, [FSUtil.node, Auth.node, Account.node, Env.node, Npm.node, httpClient])
+export const node = LayerNode.make(layer, [
+  FSUtil.node,
+  LayerNode.make(Substitution.defaultLayer, []),
+  Auth.node,
+  Account.node,
+  Env.node,
+  Npm.node,
+  httpClient,
+])
 
 export * as Config from "./config"
